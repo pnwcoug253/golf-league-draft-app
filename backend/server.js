@@ -68,6 +68,17 @@ db.serialize(() => {
     tournament_id INTEGER,
     FOREIGN KEY (tournament_id) REFERENCES tournaments (id)
   )`);
+
+  // Draft order settings table
+  db.run(`CREATE TABLE IF NOT EXISTS draft_orders (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    tournament_id INTEGER,
+    drafter_order TEXT NOT NULL,
+    week_number INTEGER,
+    season_year INTEGER,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (tournament_id) REFERENCES tournaments (id)
+  )`);
 });
 
 // Enhanced mock data with more realistic tournament field
@@ -134,6 +145,19 @@ const mockTournamentField = [
   { name: "Matt McCarty", worldRank: 60, country: "USA" }
 ];
 
+// Helper function to calculate current drafter with custom order
+const calculateCurrentDrafterWithOrder = (pickCount, drafterOrder) => {
+  const round = Math.floor(pickCount / drafterOrder.length) + 1;
+  const positionInRound = pickCount % drafterOrder.length;
+  
+  // Snake draft: odd rounds go 0,1,2,3; even rounds go 3,2,1,0
+  if (round % 2 === 1) {
+    return drafterOrder[positionInRound];
+  } else {
+    return drafterOrder[drafterOrder.length - 1 - positionInRound];
+  }
+};
+
 // API Routes
 
 // Get current tournament info
@@ -148,13 +172,13 @@ app.get('/api/tournament/current', (req, res) => {
       if (!tournament) {
         // Create current tournament if none exists
         const tournamentData = {
-          name: "The Memorial Tournament presented by Workday",
+          name: "RBC Canadian Open",
           year: new Date().getFullYear(),
           status: 'active',
           start_date: '2025-06-05',
           end_date: '2025-06-08',
-          course: 'Muirfield Village Golf Club',
-          purse: '$20,000,000'
+          course: 'Hamilton Golf & Country Club',
+          purse: '$9,900,000'
         };
         
         db.run(
@@ -244,60 +268,148 @@ app.get('/api/tournament/:id/available-players', (req, res) => {
   );
 });
 
-// Draft a player
-app.post('/api/draft', (req, res) => {
-  const { tournamentId, playerId, draftedBy } = req.body;
+// Get draft order for tournament
+app.get('/api/tournament/:id/draft-order', (req, res) => {
+  const tournamentId = req.params.id;
   
-  db.get('SELECT COUNT(*) as count FROM draft_picks WHERE tournament_id = ?', [tournamentId], (err, result) => {
-    if (err) {
-      return res.status(500).json({ error: err.message });
-    }
-    
-    const pickOrder = result.count + 1;
-    const round = Math.ceil(pickOrder / 4); // 4 drafters
-    
-    // First, get the player name
-    db.get('SELECT name FROM players WHERE id = ?', [playerId], (err, player) => {
+  db.get(
+    'SELECT * FROM draft_orders WHERE tournament_id = ? ORDER BY created_at DESC LIMIT 1',
+    [tournamentId],
+    (err, draftOrder) => {
       if (err) {
         return res.status(500).json({ error: err.message });
       }
       
-      if (!player) {
-        return res.status(404).json({ error: 'Player not found' });
+      if (!draftOrder) {
+        // Return default order if none set
+        res.json({
+          drafter_order: ['Sigl', 'Bryan', 'Conner', 'Keenan'],
+          week_number: 1,
+          season_year: new Date().getFullYear()
+        });
+      } else {
+        res.json({
+          ...draftOrder,
+          drafter_order: JSON.parse(draftOrder.drafter_order)
+        });
+      }
+    }
+  );
+});
+
+// Set draft order for tournament
+app.post('/api/tournament/:id/draft-order', (req, res) => {
+  const tournamentId = req.params.id;
+  const { drafterOrder, weekNumber } = req.body;
+  
+  const currentYear = new Date().getFullYear();
+  
+  db.run(
+    'INSERT INTO draft_orders (tournament_id, drafter_order, week_number, season_year) VALUES (?, ?, ?, ?)',
+    [tournamentId, JSON.stringify(drafterOrder), weekNumber || 1, currentYear],
+    function(err) {
+      if (err) {
+        return res.status(500).json({ error: err.message });
       }
       
-      // Update the player's drafted_by status
-      db.run(
-        'UPDATE players SET drafted_by = ? WHERE id = ? AND drafted_by IS NULL',
-        [draftedBy, playerId],
-        function(err) {
-          if (err) {
-            return res.status(500).json({ error: err.message });
-          }
-          
-          if (this.changes === 0) {
-            return res.status(400).json({ error: 'Player not available for draft' });
-          }
-          
-          // Record the draft pick
-          db.run(
-            'INSERT INTO draft_picks (tournament_id, player_name, drafted_by, pick_order, round) VALUES (?, ?, ?, ?, ?)',
-            [tournamentId, player.name, draftedBy, pickOrder, round],
-            function(err) {
-              if (err) {
-                return res.status(500).json({ error: err.message });
-              }
-              
-              res.json({ 
-                success: true, 
-                message: `${player.name} drafted by ${draftedBy}`,
-                pickOrder: pickOrder,
-                round: round
-              });
-            }
-          );
+      res.json({ 
+        success: true, 
+        message: 'Draft order set successfully',
+        id: this.lastID
+      });
+    }
+  );
+});
+
+// Get all tournaments for the season
+app.get('/api/tournaments/season/:year', (req, res) => {
+  const year = req.params.year;
+  
+  db.all(
+    'SELECT * FROM tournaments WHERE year = ? ORDER BY created_at ASC',
+    [year],
+    (err, tournaments) => {
+      if (err) {
+        return res.status(500).json({ error: err.message });
+      }
+      res.json(tournaments);
+    }
+  );
+});
+
+// Draft a player (updated with custom draft order support)
+app.post('/api/draft', (req, res) => {
+  const { tournamentId, playerId, draftedBy } = req.body;
+  
+  // First get the draft order
+  db.get('SELECT drafter_order FROM draft_orders WHERE tournament_id = ? ORDER BY created_at DESC LIMIT 1', 
+    [tournamentId], (err, orderResult) => {
+    
+    const drafterOrder = orderResult ? JSON.parse(orderResult.drafter_order) : ['Sigl', 'Bryan', 'Conner', 'Keenan'];
+    
+    db.get('SELECT COUNT(*) as count FROM draft_picks WHERE tournament_id = ?', [tournamentId], (err, result) => {
+      if (err) {
+        return res.status(500).json({ error: err.message });
+      }
+      
+      const pickOrder = result.count + 1;
+      const round = Math.ceil(pickOrder / drafterOrder.length);
+      
+      // Calculate who should be drafting
+      const expectedDrafter = calculateCurrentDrafterWithOrder(result.count, drafterOrder);
+      
+      // Verify it's the correct drafter's turn
+      if (draftedBy !== expectedDrafter) {
+        return res.status(400).json({ 
+          error: `It's ${expectedDrafter}'s turn to draft, not ${draftedBy}'s` 
+        });
+      }
+      
+      // Get the player name
+      db.get('SELECT name FROM players WHERE id = ?', [playerId], (err, player) => {
+        if (err) {
+          return res.status(500).json({ error: err.message });
         }
-      );
+        
+        if (!player) {
+          return res.status(404).json({ error: 'Player not found' });
+        }
+        
+        // Update the player's drafted_by status
+        db.run(
+          'UPDATE players SET drafted_by = ? WHERE id = ? AND drafted_by IS NULL',
+          [draftedBy, playerId],
+          function(err) {
+            if (err) {
+              return res.status(500).json({ error: err.message });
+            }
+            
+            if (this.changes === 0) {
+              return res.status(400).json({ error: 'Player not available for draft' });
+            }
+            
+            // Record the draft pick
+            db.run(
+              'INSERT INTO draft_picks (tournament_id, player_name, drafted_by, pick_order, round) VALUES (?, ?, ?, ?, ?)',
+              [tournamentId, player.name, draftedBy, pickOrder, round],
+              function(err) {
+                if (err) {
+                  return res.status(500).json({ error: err.message });
+                }
+                
+                res.json({ 
+                  success: true, 
+                  message: `${player.name} drafted by ${draftedBy}`,
+                  pickOrder: pickOrder,
+                  round: round,
+                  nextDrafter: pickOrder < drafterOrder.length * 10 ? 
+                    calculateCurrentDrafterWithOrder(pickOrder, drafterOrder) : null
+                });
+              }
+            );
+          }
+        );
+      });
     });
   });
 });
